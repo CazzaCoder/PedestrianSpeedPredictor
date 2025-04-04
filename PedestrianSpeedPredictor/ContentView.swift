@@ -55,7 +55,7 @@ class CustomARView: ARView {
     // Tracking
     private var tracks: [PersonTrack] = []
     private var frameCounter = 0
-    private let detectionInterval = 5 // Run detection every 5 frames for performance
+    private let detectionInterval = 3 // Run detection every 5 frames for performance
     private var lastFrameTimestamp: CFTimeInterval = 0.0
     
     required init(frame frameRect: CGRect) {
@@ -338,7 +338,7 @@ class CustomARView: ARView {
 extension CustomARView: ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let deltaT = frame.timestamp - lastFrameTimestamp
-        print("[INFO] Frame Time Delta: \(String(format: "%.3f\", deltaT)) seconds"))")
+        print("[INFO] Frame Time Delta: \(String(format: "%.3f", deltaT)) seconds")
         lastFrameTimestamp = frame.timestamp
         autoreleasepool {
             frameCounter += 1
@@ -365,15 +365,16 @@ extension CustomARView: ARSessionDelegate {
                 
                 // Handle detection results
                 if frameCounter % detectionInterval == 0 {
+                    print("Calculating Detection...")
                     guard let detectionRequest = requests.first(where: { $0 is VNCoreMLRequest }) as? VNCoreMLRequest,
                           let observations = detectionRequest.results as? [VNRecognizedObjectObservation] else { return }
                     let personObservations = observations.filter { $0.labels.first?.identifier.lowercased() == "person" && $0.confidence > 0.5 }
                     handleNewDetections(personObservations)
                     print("[INFO] Number of recognized observations: \(observations.count)")
                     for obs in observations {
-                        let bestLabel = obs.labels.first?.identifier ?? "unknown"
-                        let conf = obs.confidence
-                    print("   Detected \(bestLabel) with confidence \(String(format: "%.2f\", conf))"))")
+                    let bestLabel = obs.labels.first?.identifier ?? "unknown"
+                    let conf = obs.confidence
+                    print("   Detected \(bestLabel) with confidence \(String(format: "%.2f", conf))")
                     }
                 }
                 
