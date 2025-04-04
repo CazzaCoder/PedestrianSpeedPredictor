@@ -4,6 +4,7 @@ import ARKit
 import Vision
 import CoreML
 
+// MARK: - ContentView
 struct ContentView: View {
     var body: some View {
         ARViewContainer()
@@ -11,23 +12,23 @@ struct ContentView: View {
     }
 }
 
+// MARK: - ARViewContainer
 struct ARViewContainer: UIViewRepresentable {
     func makeUIView(context: Context) -> CustomARView {
-        let arView = CustomARView(frame: .zero)
-        return arView
+        CustomARView(frame: .zero)
     }
     
     func updateUIView(_ uiView: CustomARView, context: Context) {}
 }
 
-// Represents a tracked person with their data
+// MARK: - PersonTrack
 class PersonTrack {
     let id: UUID
     var lastObservation: VNDetectedObjectObservation
     var position: SIMD3<Float>?
     var lastUpdateTime: TimeInterval
-    var anchor: AnchorEntity? // Store anchor for position updates
-    var entity: ModelEntity?  // Speed label entity
+    var anchor: AnchorEntity?
+    var entity: ModelEntity?
     var speed: Float = 0.0
     var direction: SIMD3<Float> = .zero
     var lastConfidence: Float = 0.0
@@ -39,29 +40,28 @@ class PersonTrack {
         self.lastUpdateTime = time
     }
     
-    // Cleanup method to remove from scene
     func removeFromScene(_ scene: RealityKit.Scene) {
-        if let anchor = anchor {
-            scene.removeAnchor(anchor)
-        }
+        anchor?.removeFromParent()
     }
 }
 
+// MARK: - CustomARView
 class CustomARView: ARView {
-    // Vision & Model
-    private var visionRequests = [VNRequest]()
-    private let model = try! VNCoreMLModel(for: yolo11n_1080(configuration: MLModelConfiguration()).model)
-    
-    // Tracking
+    private var visionRequests: [VNRequest] = []
+    private let model: VNCoreMLModel
     private var tracks: [PersonTrack] = []
     private var frameCounter = 0
-    private let detectionInterval = 3 // Run detection every 5 frames for performance
+    private let detectionInterval = 5
     private var lastFrameTimestamp: CFTimeInterval = 0.0
     
     required init(frame frameRect: CGRect) {
+        do {
+            model = try VNCoreMLModel(for: yolo11n_640_nms(configuration: .init()).model)
+        } catch {
+            fatalError("Failed to load YOLO model: \(error)")
+        }
         super.init(frame: frameRect)
         
-        // Setup AR configuration
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal]
         session.run(config)
@@ -74,17 +74,39 @@ class CustomARView: ARView {
         fatalError("init(coder:) has not been implemented")
     }
     
+    // MARK: Vision Setup
     private func setupVision() {
-        let request = VNCoreMLRequest(model: model) { request, error in
-            guard let observations = request.results as? [VNRecognizedObjectObservation] else { return }
-            let personObservations = observations.filter { $0.labels.first?.identifier.lowercased() == "person" && $0.confidence > 0.5 }
-            self.handleNewDetections(personObservations)
+        let request = VNCoreMLRequest(model: model) { [weak self] request, error in
+            guard let self = self else { return }
+            if let error = error {
+                print("Vision request failed: \(error)")
+                return
+            }
+            guard let results = request.results else {
+                print("No results from Vision request")
+                return
+            }
+            
+            // Print the overall type and count of results
+            print("Results type: \(type(of: results))")
+            print("Number of results: \(results.count)")
+            
+            // Optional: Proceed with person filtering if detections are present
+            if let observations = results as? [VNRecognizedObjectObservation] {
+                let personObservations = observations.filter {
+                    $0.labels.first?.identifier.lowercased() == "person" && $0.confidence > 0.5
+                }
+                print("Filtered person observations: \(personObservations.count)")
+                self.handleNewDetections(personObservations)
+            } else {
+                print("No VNRecognizedObjectObservation found in results")
+            }
         }
         request.imageCropAndScaleOption = .scaleFill
         visionRequests = [request]
     }
     
-    // Handle new detections and associate with tracks
+    // MARK: Detection Handling
     private func handleNewDetections(_ detections: [VNRecognizedObjectObservation]) {
         print("[handleNewDetections] Received \(detections.count) detections")
         var newTracks: [PersonTrack] = []
@@ -94,7 +116,7 @@ class CustomARView: ARView {
             var matched = false
             for track in tracks {
                 let iou = computeIoU(box1: detection.boundingBox, box2: track.lastObservation.boundingBox)
-                if iou > 0.5 { // Threshold for matching
+                if iou > 0.5 {
                     track.lastObservation = detection
                     track.lastConfidence = detection.confidence
                     track.lastUpdateTime = currentTime
@@ -111,223 +133,165 @@ class CustomARView: ARView {
         tracks.append(contentsOf: newTracks)
     }
     
-    // Compute Intersection over Union for bounding box association
     private func computeIoU(box1: CGRect, box2: CGRect) -> Float {
         let intersection = box1.intersection(box2)
-        if intersection.isNull { return 0.0 }
+        guard !intersection.isNull else { return 0.0 }
         let intersectionArea = intersection.width * intersection.height
         let unionArea = (box1.width * box1.height) + (box2.width * box2.height) - intersectionArea
         return Float(intersectionArea / unionArea)
     }
     
-    // Update track position and speed
+    // MARK: Track Updates
     private func updateTrackPositionAndSpeed(track: inout PersonTrack, frame: ARFrame) {
         let boundingBox = track.lastObservation.boundingBox
-        let centerVision = CGPoint(x: boundingBox.midX, y: boundingBox.minY) // Bottom center for feet
+        // Adjust to slightly above the bottom for better foot positioning
+        let centerVision = CGPoint(x: boundingBox.midX, y: boundingBox.minY + boundingBox.height * 0.1)
         let viewSize = self.frame.size
         let centerPixel = CGPoint(x: centerVision.x * viewSize.width, y: (1 - centerVision.y) * viewSize.height)
         
         guard let rayResult = ray(through: centerPixel) else { return }
         
-        // Raycast to horizontal planes
         let query = ARRaycastQuery(origin: rayResult.origin, direction: rayResult.direction, allowing: .estimatedPlane, alignment: .horizontal)
-        if let result = session.raycast(query).first {
-            let newPosition = SIMD3(result.worldTransform.columns.3.x, result.worldTransform.columns.3.y, result.worldTransform.columns.3.z)
-            
-            // Compute direction vector and apply smoothing.
-            if let oldPosition = track.position {
+        guard let result = session.raycast(query).first else { return }
+        
+        let newPosition = SIMD3(result.worldTransform.columns.3.x, result.worldTransform.columns.3.y, result.worldTransform.columns.3.z)
+        
+        if let oldPosition = track.position, frame.timestamp > track.lastUpdateTime {
+            let dt = Float(frame.timestamp - track.lastUpdateTime)
+            if dt > 0 {
+                let distance = simd_length(newPosition - oldPosition)
+                track.speed = distance / dt
                 let rawDirection = newPosition - oldPosition
-                // Use a small alpha for smoothing
                 let alpha: Float = 0.7
-                track.direction = alpha * track.direction + (1 - alpha) * simd_normalize(rawDirection)
+                track.direction = alpha * track.direction + (1 - alpha) * (dt > 0 ? simd_normalize(rawDirection) : .zero)
             }
-            
-            if let oldPosition = track.position, frame.timestamp > track.lastUpdateTime {
-                let dt = Float(frame.timestamp - track.lastUpdateTime)
-                if dt > 0 {
-                    let distance = simd_length(newPosition - oldPosition)
-                    track.speed = distance / dt
-                }
-            }
-            track.position = newPosition
-            track.lastUpdateTime = frame.timestamp
-            updateEntityForTrack(&track)
         }
+        track.position = newPosition
+        track.lastUpdateTime = frame.timestamp
+        updateEntityForTrack(&track)
     }
     
-    // Create or update speed display entity
     private func updateEntityForTrack(_ track: inout PersonTrack) {
         let speedString = String(format: "%.2f m/s", track.speed)
         
         if let anchor = track.anchor, let entity = track.entity, let position = track.position {
-            // Update existing entity
-            anchor.position = position // Update anchor to new base position
-            entity.position = SIMD3<Float>(0, 1.5, 0) // 1.5m above anchor
-            let newMesh = MeshResource.generateText(speedString, font: .systemFont(ofSize: 0.1), containerFrame: .zero, alignment: .center, lineBreakMode: .byWordWrapping)
+            anchor.position = position
+            entity.position = SIMD3<Float>(0, 1.0, 0) // Lowered from 1.5 for better visibility
+            
+            let newMesh = MeshResource.generateText(
+                speedString,
+                font: .systemFont(ofSize: 0.05),
+                containerFrame: .zero,
+                alignment: .center,
+                lineBreakMode: .byWordWrapping
+            )
             entity.model?.mesh = newMesh
             
-            // Create or update the arrow entity
-            let arrowLength = track.speed * 0.5 // predicts half a second distance
+            let arrowLength = track.speed * 0.5
             let arrowDirection = track.direction
             
-            // If arrowEntity doesn't exist, create it
             if track.arrowEntity == nil {
-                // We'll build a simple arrow from a cylinder + cone.
-                let shaftRadius: Float = 0.02
-                let shaftHeight: Float = 1.0
-                let coneHeight: Float = 0.2
-
+                let shaftRadius: Float = 0.01
+                let shaftHeight: Float = 0.5
+                let coneHeight: Float = 0.1
                 let shaftMesh = MeshResource.generateCylinder(height: shaftHeight, radius: shaftRadius)
-                let coneMesh = MeshResource.generateCone(height: coneHeight, radius: 0.05)
-
+                let coneMesh = MeshResource.generateCone(height: coneHeight, radius: 0.025)
                 let shaftEntity = ModelEntity(mesh: shaftMesh, materials: [SimpleMaterial(color: .blue, isMetallic: false)])
-                // The cylinder is centered on its local origin, so we move it up by half
                 shaftEntity.position.y = shaftHeight / 2
-
                 let coneEntity = ModelEntity(mesh: coneMesh, materials: [SimpleMaterial(color: .blue, isMetallic: false)])
-                // Place cone at top of cylinder
                 coneEntity.position.y = shaftHeight
-
-                // Combine into a parent entity
                 let arrowParent = ModelEntity()
                 arrowParent.addChild(shaftEntity)
                 arrowParent.addChild(coneEntity)
-
-                // Scale it down initially
                 arrowParent.scale = SIMD3<Float>(repeating: 0.001)
-
-                // Attach to anchor
-                track.anchor?.addChild(arrowParent)
+                anchor.addChild(arrowParent)
                 track.arrowEntity = arrowParent
             }
-
+            
             if let arrowEntity = track.arrowEntity {
-                // If confidence has dipped below 0.5, reduce opacity
                 let arrowOpacity: Float = track.lastConfidence < 0.5 ? 0.3 : 1.0
                 let materials = [SimpleMaterial(color: .blue.withAlphaComponent(CGFloat(arrowOpacity)), isMetallic: false)]
-
-                // Update materials on arrow children
                 for child in arrowEntity.children {
                     if var model = child as? ModelEntity {
                         model.model?.materials = materials
                     }
                 }
-
-                // Adjust total arrow length to reflect speed * time window.
-                // We'll scale the arrow's height accordingly.
-                // The default arrow is 1.2m tall (cylinder + cone). We'll scale it.
-                let baseHeight: Float = 1.2
+                let baseHeight: Float = 0.6
                 let targetScale = arrowLength / baseHeight
-
-                // Update arrow scale
                 arrowEntity.scale = SIMD3<Float>(repeating: 0.001 + max(targetScale, 0.0))
-
-                // Rotate the arrow to point in track.direction
-                // The arrow is oriented along +Y, so we compute a rotation from +Y to arrowDirection.
-                // If arrowDirection is near zero, skip.
+                
                 if simd_length(arrowDirection) > 0.0001 {
-                    // Normalized direction in XZ plane or full 3D?
                     let up = SIMD3<Float>(0, 1, 0)
-                    // Axis is cross( up, arrowDirection ), angle is arccos(dot(up, arrowDirection)).
                     let dirNorm = simd_normalize(arrowDirection)
                     let dotVal = simd_dot(up, dirNorm)
                     let angle = acos(dotVal)
                     let axis = simd_normalize(simd_cross(up, dirNorm))
-                    if !axis.x.isNaN && !axis.y.isNaN && !axis.z.isNaN {
+                    if !axis.allFinite {
                         arrowEntity.orientation = simd_quatf(angle: angle, axis: axis)
                     }
                 }
-
-                // Place arrow at feet level. The anchor is at the person's foot position, so we just do:
                 arrowEntity.position = .zero
             }
         } else if let position = track.position {
-            // Create new anchor and entity
             let anchor = AnchorEntity(world: position)
             let labelEntity = ModelEntity(
-                mesh: MeshResource.generateText(speedString, font: .systemFont(ofSize: 0.1), containerFrame: .zero, alignment: .center, lineBreakMode: .byWordWrapping),
+                mesh: MeshResource.generateText(
+                    speedString,
+                    font: .systemFont(ofSize: 0.05),
+                    containerFrame: .zero,
+                    alignment: .center,
+                    lineBreakMode: .byWordWrapping
+                ),
                 materials: [SimpleMaterial(color: .white, isMetallic: false)]
             )
-            labelEntity.scale = SIMD3<Float>(repeating: 0.2)
-            labelEntity.position = SIMD3<Float>(0, 1.5, 0) // 1.5m above anchor
+            labelEntity.scale = SIMD3<Float>(repeating: 0.1)
+            labelEntity.position = SIMD3<Float>(0, 1.0, 0)
             anchor.addChild(labelEntity)
             scene.addAnchor(anchor)
             track.anchor = anchor
             track.entity = labelEntity
             
-            // Create or update the arrow entity
-            let arrowLength = track.speed * 0.5 // predicts half a second distance
+            let arrowLength = track.speed * 0.5
             let arrowDirection = track.direction
             
-            // If arrowEntity doesn't exist, create it
-            if track.arrowEntity == nil {
-                // We'll build a simple arrow from a cylinder + cone.
-                let shaftRadius: Float = 0.02
-                let shaftHeight: Float = 1.0
-                let coneHeight: Float = 0.2
-
-                let shaftMesh = MeshResource.generateCylinder(height: shaftHeight, radius: shaftRadius)
-                let coneMesh = MeshResource.generateCone(height: coneHeight, radius: 0.05)
-
-                let shaftEntity = ModelEntity(mesh: shaftMesh, materials: [SimpleMaterial(color: .blue, isMetallic: false)])
-                // The cylinder is centered on its local origin, so we move it up by half
-                shaftEntity.position.y = shaftHeight / 2
-
-                let coneEntity = ModelEntity(mesh: coneMesh, materials: [SimpleMaterial(color: .blue, isMetallic: false)])
-                // Place cone at top of cylinder
-                coneEntity.position.y = shaftHeight
-
-                // Combine into a parent entity
-                let arrowParent = ModelEntity()
-                arrowParent.addChild(shaftEntity)
-                arrowParent.addChild(coneEntity)
-
-                // Scale it down initially
-                arrowParent.scale = SIMD3<Float>(repeating: 0.001)
-
-                // Attach to anchor
-                track.anchor?.addChild(arrowParent)
-                track.arrowEntity = arrowParent
-            }
-
+            let shaftRadius: Float = 0.01
+            let shaftHeight: Float = 0.5
+            let coneHeight: Float = 0.1
+            let shaftMesh = MeshResource.generateCylinder(height: shaftHeight, radius: shaftRadius)
+            let coneMesh = MeshResource.generateCone(height: coneHeight, radius: 0.025)
+            let shaftEntity = ModelEntity(mesh: shaftMesh, materials: [SimpleMaterial(color: .blue, isMetallic: false)])
+            shaftEntity.position.y = shaftHeight / 2
+            let coneEntity = ModelEntity(mesh: coneMesh, materials: [SimpleMaterial(color: .blue, isMetallic: false)])
+            coneEntity.position.y = shaftHeight
+            let arrowParent = ModelEntity()
+            arrowParent.addChild(shaftEntity)
+            arrowParent.addChild(coneEntity)
+            arrowParent.scale = SIMD3<Float>(repeating: 0.001)
+            anchor.addChild(arrowParent)
+            track.arrowEntity = arrowParent
+            
             if let arrowEntity = track.arrowEntity {
-                // If confidence has dipped below 0.5, reduce opacity
                 let arrowOpacity: Float = track.lastConfidence < 0.5 ? 0.3 : 1.0
                 let materials = [SimpleMaterial(color: .blue.withAlphaComponent(CGFloat(arrowOpacity)), isMetallic: false)]
-
-                // Update materials on arrow children
                 for child in arrowEntity.children {
                     if var model = child as? ModelEntity {
                         model.model?.materials = materials
                     }
                 }
-
-                // Adjust total arrow length to reflect speed * time window.
-                // We'll scale the arrow's height accordingly.
-                // The default arrow is 1.2m tall (cylinder + cone). We'll scale it.
-                let baseHeight: Float = 1.2
+                let baseHeight: Float = 0.6
                 let targetScale = arrowLength / baseHeight
-
-                // Update arrow scale
                 arrowEntity.scale = SIMD3<Float>(repeating: 0.001 + max(targetScale, 0.0))
-
-                // Rotate the arrow to point in track.direction
-                // The arrow is oriented along +Y, so we compute a rotation from +Y to arrowDirection.
-                // If arrowDirection is near zero, skip.
+                
                 if simd_length(arrowDirection) > 0.0001 {
-                    // Normalized direction in XZ plane or full 3D?
                     let up = SIMD3<Float>(0, 1, 0)
-                    // Axis is cross( up, arrowDirection ), angle is arccos(dot(up, arrowDirection)).
                     let dirNorm = simd_normalize(arrowDirection)
                     let dotVal = simd_dot(up, dirNorm)
                     let angle = acos(dotVal)
                     let axis = simd_normalize(simd_cross(up, dirNorm))
-                    if !axis.x.isNaN && !axis.y.isNaN && !axis.z.isNaN {
+                    if !axis.allFinite {
                         arrowEntity.orientation = simd_quatf(angle: angle, axis: axis)
                     }
                 }
-
-                // Place arrow at feet level. The anchor is at the person's foot position, so we just do:
                 arrowEntity.position = .zero
             }
         }
@@ -338,21 +302,20 @@ class CustomARView: ARView {
 extension CustomARView: ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let deltaT = frame.timestamp - lastFrameTimestamp
-        print("[INFO] Frame Time Delta: \(String(format: "%.3f", deltaT)) seconds")
+//        print("[INFO] Frame Time Delta: \(String(format: "%.3f", deltaT)) seconds")
         lastFrameTimestamp = frame.timestamp
+        
         autoreleasepool {
             frameCounter += 1
             let pixelBuffer = frame.capturedImage
-            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+            let orientation = UIDevice.current.orientation.cgImageOrientation
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
             
             var requests: [VNRequest] = []
-            
-            // Periodic detection
             if frameCounter % detectionInterval == 0 {
                 requests.append(visionRequests[0])
             }
             
-            // Tracking for existing tracks
             for track in tracks {
                 let trackingRequest = VNTrackObjectRequest(detectedObjectObservation: track.lastObservation)
                 trackingRequest.trackingLevel = .accurate
@@ -361,38 +324,20 @@ extension CustomARView: ARSessionDelegate {
             
             do {
                 try handler.perform(requests)
-                print("[INFO] Frame #\(frameCounter) processed at timestamp \(frame.timestamp)")
+//                print("[INFO] Frame #\(frameCounter) processed at timestamp \(frame.timestamp)")
                 
-                // Handle detection results
-                if frameCounter % detectionInterval == 0 {
-                    print("Calculating Detection...")
-                    guard let detectionRequest = requests.first(where: { $0 is VNCoreMLRequest }) as? VNCoreMLRequest,
-                          let observations = detectionRequest.results as? [VNRecognizedObjectObservation] else { return }
-                    let personObservations = observations.filter { $0.labels.first?.identifier.lowercased() == "person" && $0.confidence > 0.5 }
-                    handleNewDetections(personObservations)
-                    print("[INFO] Number of recognized observations: \(observations.count)")
-                    for obs in observations {
-                    let bestLabel = obs.labels.first?.identifier ?? "unknown"
-                    let conf = obs.confidence
-                    print("   Detected \(bestLabel) with confidence \(String(format: "%.2f", conf))")
-                    }
-                }
-                
-                // Handle tracking results
                 for request in requests where request is VNTrackObjectRequest {
-                    if let result = request.results?.first as? VNDetectedObjectObservation {
-                        if let index = tracks.firstIndex(where: { $0.lastObservation == (request as! VNTrackObjectRequest).inputObservation }) {
-                            tracks[index].lastObservation = result
-                            updateTrackPositionAndSpeed(track: &tracks[index], frame: frame)
-                        }
+                    if let result = request.results?.first as? VNDetectedObjectObservation,
+                       let index = tracks.firstIndex(where: { $0.lastObservation == (request as! VNTrackObjectRequest).inputObservation }) {
+                        tracks[index].lastObservation = result
+                        updateTrackPositionAndSpeed(track: &tracks[index], frame: frame)
                     }
                 }
                 
-                // Clean up old tracks
                 let currentTime = frame.timestamp
-                let activeTracks = tracks.filter { currentTime - $0.lastUpdateTime < 1.0 } // Tracks expire after 1 second
+                let activeTracks = tracks.filter { currentTime - $0.lastUpdateTime < 1.0 }
                 for track in tracks where !activeTracks.contains(where: { $0.id == track.id }) {
-                    track.removeFromScene(scene) // Properly remove anchor from scene
+                    track.removeFromScene(scene)
                 }
                 tracks = activeTracks
                 
@@ -403,6 +348,27 @@ extension CustomARView: ARSessionDelegate {
     }
 }
 
+// MARK: - UIDeviceOrientation Extension
+extension UIDeviceOrientation {
+    var cgImageOrientation: CGImagePropertyOrientation {
+        switch self {
+        case .portrait: return .up
+        case .portraitUpsideDown: return .down
+        case .landscapeLeft: return .left
+        case .landscapeRight: return .right
+        default: return .up
+        }
+    }
+}
+
+// MARK: - SIMD3 Extension
+extension SIMD3 where Scalar == Float {
+    var allFinite: Bool {
+        !x.isNaN && !y.isNaN && !z.isNaN && !x.isInfinite && !y.isInfinite && !z.isInfinite
+    }
+}
+
+// MARK: - Preview
 #Preview {
     ContentView()
 }
